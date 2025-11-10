@@ -1,9 +1,11 @@
 const MAX_DICT_SIZE: usize = 0xFFFF;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
+use std::collections::HashMap;
 
 struct LZWCoder {
     dict: Vec<(u8, Option<u16>)>,
+    reverse_dict_map: HashMap<(u8, Option<u16>), u16>,  // Used for O(1) lookup for elements, doubles memory usage
     max_dict_size: usize,
     clear_dict_on_overfill: bool,
 }
@@ -11,29 +13,42 @@ struct LZWCoder {
 impl LZWCoder {
     fn set_init_dict(&mut self) {
         self.dict.clear();
+        self.reverse_dict_map.clear();
+        
         for i in 0..256 {
             self.dict.push((i as u8, None));
+            self.reverse_dict_map.insert((i as u8, None), i as u16);
         }
     }
 
     fn find_seq_in_dict(&self, (char, idx): (u8, Option<u16>)) -> Option<u16> {
-        if let Some(idx) = self.dict.iter().position(|&entry| entry == (char, idx)) {
-            Some(idx as u16)
+        if let Some(&res_idx) = self.reverse_dict_map.get(&(char, idx)) {
+            Some(res_idx)
         } else {
             None
         }
     }
 
-    fn add_seq_to_dict(&mut self, (char, idx): (u8, Option<u16>)) {
+    // Returns true if added, false if dictionary was cleared instead
+    fn add_seq_to_dict(&mut self, (char, idx): (u8, Option<u16>)) -> bool {
         if self.dict.len() > self.max_dict_size {
             if self.clear_dict_on_overfill {
-                return;
-            } else {
+                // Reset dictionary
                 self.dict.resize(256, (0, None));
+
+                self.reverse_dict_map.clear();
+                for i in 0..256 {
+                    self.reverse_dict_map.insert((i as u8, None), i as u16);
+                }
+
+                return false;
             }
+        } else {
+            self.dict.push((char, idx));
+            self.reverse_dict_map.insert((char, idx), self.get_last_dict_index());
         }
         
-        self.dict.push((char, idx));
+        return true;
     }
 
     fn recover_seq_from_dict(&self, mut idx: u16) -> Option<Vec<u8>> {
@@ -58,7 +73,7 @@ impl LZWCoder {
     }
 
     fn get_last_dict_index(&self) -> u16 {
-        self.dict.len() as u16 - 1
+        (self.dict.len() - 1) as u16
     }
 }
 
@@ -68,6 +83,7 @@ pub fn encode(input: &[u8], clear_dict_on_overfill: bool) -> Vec<u8> {
     // Create encoder and initialize dictionary
     let mut internal_encoder = LZWCoder {
         dict: Vec::new(),
+        reverse_dict_map: HashMap::new(),
         max_dict_size: MAX_DICT_SIZE,
         clear_dict_on_overfill
     };
@@ -106,6 +122,7 @@ pub fn decode(input: &[u8]) -> Vec<u8> {
     // Create decoder and initialize dictionary
     let mut internal_decoder = LZWCoder {
         dict: Vec::new(),
+        reverse_dict_map: HashMap::new(),
         max_dict_size: last_dict_index as usize + 1,    // We store only two bytes to ensure the limitation of max 16 bits for code
         clear_dict_on_overfill
     };
@@ -122,27 +139,39 @@ pub fn decode(input: &[u8]) -> Vec<u8> {
     }
 
     let mut old_I: u16 = I;
+    let mut reset_occurred: bool = false;
 
     for chunk in input[5..].chunks(2) {
         // Read next idx
         let I = u16::from_le_bytes(chunk.try_into().unwrap());
         
-        if let Some(S) = internal_decoder.recover_seq_from_dict(I) {
-            output.extend_from_slice(&S);
-            internal_decoder.add_seq_to_dict((S[0], Some(old_I)));
+        if reset_occurred {
+            // If reset occurred, start from scratch
+            if let Some((fb, _)) = internal_decoder.dict.get(I as usize) {
+                output.push(*fb);   // Send it directly to output
+            } else {
+                panic!("Corrupted input data: first index not in dictionary");
+            }
             old_I = I;
+            reset_occurred = false;
         } else {
-            // Special case (only case when I is not in dict - covering sequences)
-            // S = old_S || old_S[0]
-            if let Some(old_S) = internal_decoder.recover_seq_from_dict(old_I) {
-                output.extend_from_slice(&old_S);
-                output.push(old_S[0]);
+            if let Some(S) = internal_decoder.recover_seq_from_dict(I) {
+                output.extend_from_slice(&S);
+                reset_occurred = !internal_decoder.add_seq_to_dict((S[0], Some(old_I)));
+                old_I = I;
+            } else {
+                // Special case (only case when I is not in dict - covering sequences)
+                // S = old_S || old_S[0]
+                if let Some(old_S) = internal_decoder.recover_seq_from_dict(old_I) {
+                    output.extend_from_slice(&old_S);
+                    output.push(old_S[0]);
 
-                // Add this sequence to the dict
-                internal_decoder.add_seq_to_dict((old_S[0], Some(old_I)));
+                    // Add this sequence to the dict
+                    reset_occurred = !internal_decoder.add_seq_to_dict((old_S[0], Some(old_I)));
 
-                // Set I to newly added sequence
-                old_I = internal_decoder.get_last_dict_index();
+                    // Set I to newly added sequence
+                    old_I = internal_decoder.get_last_dict_index();
+                }
             }
         }
     }
@@ -163,6 +192,7 @@ pub fn encode_file(input_path: &str, output_path: &str, clear_dict_on_overfill: 
     // Create encoder and initialize dictionary
     let mut internal_encoder = LZWCoder {
         dict: Vec::new(),
+        reverse_dict_map: HashMap::new(),
         max_dict_size: MAX_DICT_SIZE,
         clear_dict_on_overfill
     };
@@ -208,6 +238,7 @@ pub fn decode_file(input_path: &str, output_path: &str) {
     // Create decoder and initialize dictionary
     let mut internal_decoder = LZWCoder {
         dict: Vec::new(),
+        reverse_dict_map: HashMap::new(),
         max_dict_size: last_dict_index as usize + 1,    // We store only two bytes to ensure the limitation of max 16 bits for code
         clear_dict_on_overfill
     };
@@ -226,27 +257,39 @@ pub fn decode_file(input_path: &str, output_path: &str) {
     }
 
     let mut old_I: u16 = I;
+    let mut reset_occurred: bool = false;
 
     while let Some(_) = reader.read_exact(&mut idx_buff).ok() {
         // Read next idx
         let I = u16::from_le_bytes(idx_buff.try_into().unwrap());
 
-        if let Some(S) = internal_decoder.recover_seq_from_dict(I) {
-            writer.write(&S).unwrap();
-            internal_decoder.add_seq_to_dict((S[0], Some(old_I)));
+        if reset_occurred {
+            // If reset occurred, start from scratch
+            if let Some((fb, _)) = internal_decoder.dict.get(I as usize) {
+                writer.write(&[*fb]).unwrap();   // Send it directly to output
+            } else {
+                panic!("Corrupted input data: first index not in dictionary");
+            }
             old_I = I;
+            reset_occurred = false;
         } else {
-            // Special case (only case when I is not in dict - covering sequences)
-            // S = old_S || old_S[0]
-            if let Some(old_S) = internal_decoder.recover_seq_from_dict(old_I) {
-                writer.write(&old_S).unwrap();
-                writer.write(&old_S[0..1]).unwrap();
+            if let Some(S) = internal_decoder.recover_seq_from_dict(I) {
+                writer.write(&S).unwrap();
+                reset_occurred = !internal_decoder.add_seq_to_dict((S[0], Some(old_I)));
+                old_I = I;
+            } else {
+                // Special case (only case when I is not in dict - covering sequences)
+                // S = old_S || old_S[0]
+                if let Some(old_S) = internal_decoder.recover_seq_from_dict(old_I) {
+                    writer.write(&old_S).unwrap();
+                    writer.write(&old_S[0..1]).unwrap();
 
-                // Add this sequence to the dict
-                internal_decoder.add_seq_to_dict((old_S[0], Some(old_I)));
+                    // Add this sequence to the dict
+                    reset_occurred = !internal_decoder.add_seq_to_dict((old_S[0], Some(old_I)));
 
-                // Set I to newly added sequence
-                old_I = internal_decoder.get_last_dict_index();
+                    // Set I to newly added sequence
+                    old_I = internal_decoder.get_last_dict_index();
+                }
             }
         }
     }
