@@ -3,6 +3,7 @@ const MAX_DICT_SIZE: usize = 0xFFFF;
 pub struct LZWCoder {
     dict: Vec<(u8, Option<u16>)>,
     max_dict_size: usize,
+    clear_dict_on_overfill: bool,
 }
 
 impl LZWCoder {
@@ -23,7 +24,11 @@ impl LZWCoder {
 
     fn add_seq_to_dict(&mut self, (char, idx): (u8, Option<u16>)) {
         if self.dict.len() > self.max_dict_size {
-            self.dict.resize(256, (0, None));
+            if self.clear_dict_on_overfill {
+                return;
+            } else {
+                self.dict.resize(256, (0, None));
+            }
         }
         
         self.dict.push((char, idx));
@@ -50,30 +55,40 @@ impl LZWCoder {
         }
     }
 
-    pub fn encode(input: &[u8]) -> Vec<u8> {
+    fn get_last_dict_index(&self) -> u16 {
+        self.dict.len() as u16 - 1
+    }
+
+    pub fn encode(input: &[u8], clear_dict_on_overfill: bool) -> Vec<u8> {
         let mut output: Vec<u8> = Vec::new();
 
         // Create encoder and initialize dictionary
         let mut internal_encoder = LZWCoder {
             dict: Vec::new(),
             max_dict_size: MAX_DICT_SIZE,
+            clear_dict_on_overfill
         };
+
+        // Store parameters for decoder
+        output.push(if clear_dict_on_overfill { 1 } else { 0 });
+        output.extend_from_slice(&(internal_encoder.max_dict_size as u16).to_le_bytes());
+
         internal_encoder.set_init_dict();
 
-        // let mut S: Vec<u8> = Vec::new();
+        let mut S: Vec<u8> = Vec::new();
         let mut I: Option<u16> = None;
 
         for &byte in input.iter() {
-            // S.push(byte);
             if let Some(idx) = internal_encoder.find_seq_in_dict((byte, I)) {
                 I = Some(idx);
-                // S.push(byte);
+                S.push(byte);
             } else {
                 output.extend_from_slice(&I.unwrap().to_le_bytes());
                 internal_encoder.add_seq_to_dict((byte, I));
 
-                // S.clear();
-                // S.push(byte);
+                S.clear();
+                S.push(byte);
+
                 I = Some(byte as u16);  // I -> idx of byte (bytes are filled sequentially)
             }
         }
@@ -86,15 +101,20 @@ impl LZWCoder {
     pub fn decode(input: &[u8]) -> Vec<u8> {
         let mut output: Vec<u8> = Vec::new();
 
+        // Read first three bytes to restore parameters of encoder
+        let clear_dict_on_overfill = input[0] != 0;
+        let last_dict_index = u16::from_le_bytes(input[1..3].try_into().unwrap());
+
         // Create decoder and initialize dictionary
         let mut internal_decoder = LZWCoder {
             dict: Vec::new(),
-            max_dict_size: MAX_DICT_SIZE,
+            max_dict_size: last_dict_index as usize + 1,    // We store only two bytes to ensure the limitation of max 16 bits for code
+            clear_dict_on_overfill
         };
         internal_decoder.set_init_dict();
 
         // Read first idx
-        let I = u16::from_le_bytes(input[0..2].try_into().unwrap());
+        let I = u16::from_le_bytes(input[3..5].try_into().unwrap());
         let mut S: Vec<u8> = Vec::new();
 
         // First byte should be always in the dict
@@ -106,14 +126,12 @@ impl LZWCoder {
         }
 
         let mut old_I: u16 = I;
-        // let mut old_S = S;
-        // S = Vec::new();
 
-        for chunk in input[2..].chunks(2) {
+        for chunk in input[5..].chunks(2) {
             // Read next idx
             let I = u16::from_le_bytes(chunk.try_into().unwrap());
             //                           [chunk[0], chunk[1]];
-
+            
             if let Some(S) = internal_decoder.recover_seq_from_dict(I) {
                 output.extend_from_slice(&S);
                 internal_decoder.add_seq_to_dict((S[0], Some(old_I)));
@@ -127,6 +145,9 @@ impl LZWCoder {
 
                     // Add this sequence to the dict
                     internal_decoder.add_seq_to_dict((old_S[0], Some(old_I)));
+
+                    // Set I to newly added sequence
+                    old_I = internal_decoder.get_last_dict_index();
                 }
             }
         }
