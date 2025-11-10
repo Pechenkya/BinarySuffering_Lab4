@@ -1,6 +1,8 @@
 const MAX_DICT_SIZE: usize = 0xFFFF;
+use std::fs::{File, OpenOptions};
+use std::io::{BufReader, BufWriter, Read, Write};
 
-pub struct LZWCoder {
+struct LZWCoder {
     dict: Vec<(u8, Option<u16>)>,
     max_dict_size: usize,
     clear_dict_on_overfill: bool,
@@ -58,100 +60,194 @@ impl LZWCoder {
     fn get_last_dict_index(&self) -> u16 {
         self.dict.len() as u16 - 1
     }
+}
 
-    pub fn encode(input: &[u8], clear_dict_on_overfill: bool) -> Vec<u8> {
-        let mut output: Vec<u8> = Vec::new();
+pub fn encode(input: &[u8], clear_dict_on_overfill: bool) -> Vec<u8> {
+    let mut output: Vec<u8> = Vec::new();
 
-        // Create encoder and initialize dictionary
-        let mut internal_encoder = LZWCoder {
-            dict: Vec::new(),
-            max_dict_size: MAX_DICT_SIZE,
-            clear_dict_on_overfill
-        };
+    // Create encoder and initialize dictionary
+    let mut internal_encoder = LZWCoder {
+        dict: Vec::new(),
+        max_dict_size: MAX_DICT_SIZE,
+        clear_dict_on_overfill
+    };
 
-        // Store parameters for decoder
-        output.push(if clear_dict_on_overfill { 1 } else { 0 });
-        output.extend_from_slice(&(internal_encoder.max_dict_size as u16).to_le_bytes());
+    // Store parameters for decoder into first three bytes
+    output.push(if clear_dict_on_overfill { 1 } else { 0 });
+    output.extend_from_slice(&(internal_encoder.max_dict_size as u16).to_le_bytes());
 
-        internal_encoder.set_init_dict();
+    internal_encoder.set_init_dict();
 
-        let mut S: Vec<u8> = Vec::new();
-        let mut I: Option<u16> = None;
+    let mut I: Option<u16> = None;
 
-        for &byte in input.iter() {
-            if let Some(idx) = internal_encoder.find_seq_in_dict((byte, I)) {
-                I = Some(idx);
-                S.push(byte);
-            } else {
-                output.extend_from_slice(&I.unwrap().to_le_bytes());
-                internal_encoder.add_seq_to_dict((byte, I));
+    for &byte in input.iter() {
+        if let Some(idx) = internal_encoder.find_seq_in_dict((byte, I)) {
+            I = Some(idx);
+        } else {
+            output.extend_from_slice(&I.unwrap().to_le_bytes());
+            internal_encoder.add_seq_to_dict((byte, I));
 
-                S.clear();
-                S.push(byte);
-
-                I = Some(byte as u16);  // I -> idx of byte (bytes are filled sequentially)
-            }
+            I = Some(byte as u16);  // I -> idx of byte (bytes are filled sequentially)
         }
-
-        output.extend_from_slice(&I.unwrap().to_le_bytes());
-
-        return output;
     }
 
-    pub fn decode(input: &[u8]) -> Vec<u8> {
-        let mut output: Vec<u8> = Vec::new();
+    output.extend_from_slice(&I.unwrap().to_le_bytes());
 
-        // Read first three bytes to restore parameters of encoder
-        let clear_dict_on_overfill = input[0] != 0;
-        let last_dict_index = u16::from_le_bytes(input[1..3].try_into().unwrap());
+    return output;
+}
 
-        // Create decoder and initialize dictionary
-        let mut internal_decoder = LZWCoder {
-            dict: Vec::new(),
-            max_dict_size: last_dict_index as usize + 1,    // We store only two bytes to ensure the limitation of max 16 bits for code
-            clear_dict_on_overfill
-        };
-        internal_decoder.set_init_dict();
+pub fn decode(input: &[u8]) -> Vec<u8> {
+    let mut output: Vec<u8> = Vec::new();
 
-        // Read first idx
-        let I = u16::from_le_bytes(input[3..5].try_into().unwrap());
-        let mut S: Vec<u8> = Vec::new();
+    // Read first three bytes to restore parameters of encoder
+    let clear_dict_on_overfill = input[0] != 0;
+    let last_dict_index = u16::from_le_bytes(input[1..3].try_into().unwrap());
 
-        // First byte should be always in the dict
-        if let Some((fb, _)) = internal_decoder.dict.get(I as usize) {
-            S.push(*fb);
-            output.push(*fb);   // Send it directly to output
+    // Create decoder and initialize dictionary
+    let mut internal_decoder = LZWCoder {
+        dict: Vec::new(),
+        max_dict_size: last_dict_index as usize + 1,    // We store only two bytes to ensure the limitation of max 16 bits for code
+        clear_dict_on_overfill
+    };
+    internal_decoder.set_init_dict();
+
+    // Read first idx
+    let I = u16::from_le_bytes(input[3..5].try_into().unwrap());
+
+    // First byte should be always in the dict
+    if let Some((fb, _)) = internal_decoder.dict.get(I as usize) {
+        output.push(*fb);   // Send it directly to output
+    } else {
+        panic!("Corrupted input data: first index not in dictionary");
+    }
+
+    let mut old_I: u16 = I;
+
+    for chunk in input[5..].chunks(2) {
+        // Read next idx
+        let I = u16::from_le_bytes(chunk.try_into().unwrap());
+        
+        if let Some(S) = internal_decoder.recover_seq_from_dict(I) {
+            output.extend_from_slice(&S);
+            internal_decoder.add_seq_to_dict((S[0], Some(old_I)));
+            old_I = I;
         } else {
-            panic!("Corrupted input data: first index not in dictionary");
-        }
+            // Special case (only case when I is not in dict - covering sequences)
+            // S = old_S || old_S[0]
+            if let Some(old_S) = internal_decoder.recover_seq_from_dict(old_I) {
+                output.extend_from_slice(&old_S);
+                output.push(old_S[0]);
 
-        let mut old_I: u16 = I;
+                // Add this sequence to the dict
+                internal_decoder.add_seq_to_dict((old_S[0], Some(old_I)));
 
-        for chunk in input[5..].chunks(2) {
-            // Read next idx
-            let I = u16::from_le_bytes(chunk.try_into().unwrap());
-            //                           [chunk[0], chunk[1]];
-            
-            if let Some(S) = internal_decoder.recover_seq_from_dict(I) {
-                output.extend_from_slice(&S);
-                internal_decoder.add_seq_to_dict((S[0], Some(old_I)));
-                old_I = I;
-            } else {
-                // Special case (only case when I is not in dict - covering sequences)
-                // S = old_S || old_S[0]
-                if let Some(old_S) = internal_decoder.recover_seq_from_dict(old_I) {
-                    output.extend_from_slice(&old_S);
-                    output.push(old_S[0]);
-
-                    // Add this sequence to the dict
-                    internal_decoder.add_seq_to_dict((old_S[0], Some(old_I)));
-
-                    // Set I to newly added sequence
-                    old_I = internal_decoder.get_last_dict_index();
-                }
+                // Set I to newly added sequence
+                old_I = internal_decoder.get_last_dict_index();
             }
         }
+    }
 
-        return output;
+    return output;
+}
+
+pub fn encode_file(input_path: &str, output_path: &str, clear_dict_on_overfill: bool) {
+    let input_file = File::open(input_path).unwrap();
+    let reader = BufReader::new(input_file);
+
+    let output_file = OpenOptions::new().write(true)
+                                        .create(true)
+                                        .truncate(true)
+                                        .open(output_path).unwrap();
+    let mut writer = BufWriter::new(output_file);
+
+    // Create encoder and initialize dictionary
+    let mut internal_encoder = LZWCoder {
+        dict: Vec::new(),
+        max_dict_size: MAX_DICT_SIZE,
+        clear_dict_on_overfill
+    };
+
+    // Store parameters for decoder into first three bytes
+    writer.write(&[ if clear_dict_on_overfill { 1 } else { 0 } ]).unwrap();
+    writer.write(&(internal_encoder.max_dict_size as u16).to_le_bytes()).unwrap();
+
+    internal_encoder.set_init_dict();
+
+    let mut I: Option<u16> = None;
+
+    for byte in reader.bytes().map(|b| b.unwrap()) {
+        if let Some(idx) = internal_encoder.find_seq_in_dict((byte, I)) {
+            I = Some(idx);
+        } else {
+            writer.write(&I.unwrap().to_le_bytes()).unwrap();
+            internal_encoder.add_seq_to_dict((byte, I));
+
+            I = Some(byte as u16);  // I -> idx of byte (bytes are filled sequentially)
+        }
+    }
+
+    writer.write(&I.unwrap().to_le_bytes()).unwrap();
+}
+
+pub fn decode_file(input_path: &str, output_path: &str) {
+    let input_file = File::open(input_path).unwrap();
+    let mut reader = BufReader::new(input_file);
+
+    let output_file = OpenOptions::new().write(true)
+                                        .create(true)
+                                        .truncate(true)
+                                        .open(output_path).unwrap();
+    let mut writer = BufWriter::new(output_file);
+
+    // Read first three bytes to restore parameters of encoder
+    let mut param_buff = [0u8; 3];
+    reader.read_exact(&mut param_buff).unwrap();
+    let clear_dict_on_overfill = param_buff[0] != 0;
+    let last_dict_index = u16::from_le_bytes(param_buff[1..3].try_into().unwrap());
+
+    // Create decoder and initialize dictionary
+    let mut internal_decoder = LZWCoder {
+        dict: Vec::new(),
+        max_dict_size: last_dict_index as usize + 1,    // We store only two bytes to ensure the limitation of max 16 bits for code
+        clear_dict_on_overfill
+    };
+    internal_decoder.set_init_dict();
+
+    // Read first idx
+    let mut idx_buff = [0u8; 2];
+    reader.read_exact(&mut idx_buff).unwrap();
+    let I = u16::from_le_bytes(idx_buff);
+
+    // First byte should be always in the dict
+    if let Some((fb, _)) = internal_decoder.dict.get(I as usize) {
+        writer.write(&[*fb]).unwrap();   // Send it directly to output
+    } else {
+        panic!("Corrupted input data: first index not in dictionary");
+    }
+
+    let mut old_I: u16 = I;
+
+    while let Some(_) = reader.read_exact(&mut idx_buff).ok() {
+        // Read next idx
+        let I = u16::from_le_bytes(idx_buff.try_into().unwrap());
+
+        if let Some(S) = internal_decoder.recover_seq_from_dict(I) {
+            writer.write(&S).unwrap();
+            internal_decoder.add_seq_to_dict((S[0], Some(old_I)));
+            old_I = I;
+        } else {
+            // Special case (only case when I is not in dict - covering sequences)
+            // S = old_S || old_S[0]
+            if let Some(old_S) = internal_decoder.recover_seq_from_dict(old_I) {
+                writer.write(&old_S).unwrap();
+                writer.write(&old_S[0..1]).unwrap();
+
+                // Add this sequence to the dict
+                internal_decoder.add_seq_to_dict((old_S[0], Some(old_I)));
+
+                // Set I to newly added sequence
+                old_I = internal_decoder.get_last_dict_index();
+            }
+        }
     }
 }
