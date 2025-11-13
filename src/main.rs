@@ -34,7 +34,7 @@ fn decode_file_with_timer(input_path: &'static str, output_path: &'static str) {
     while !decoding_handle.is_finished() {
         print!("\rDecoding time: {:?}", start.elapsed());
         std::io::Write::flush(&mut std::io::stdout()).unwrap();
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
     
     let decode_duration = decoding_handle.join().unwrap();
