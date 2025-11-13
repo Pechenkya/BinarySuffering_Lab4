@@ -39,15 +39,6 @@ impl LZWCoder {
             return true;
         } else {
             return false;
-            // if self.clear_dict_on_overfill {
-            //     self.dict.truncate(256);
-            //     self.reverse_dict_map.clear();
-            //     for i in 0..256 {
-            //         self.reverse_dict_map.insert((i as u8, None), i as u16);
-            //     }
-            // } else {
-            //     return;
-            // }
         }
     }
 
@@ -63,11 +54,10 @@ impl LZWCoder {
             }
         }
 
-        seq.reverse();
-
         if seq.is_empty() {
             None
         } else {
+            seq.reverse();
             Some(seq)
         }
     }
@@ -101,7 +91,13 @@ pub fn encode(input: &[u8], clear_dict_on_overfill: bool) -> Vec<u8> {
             I = Some(idx);
         } else {
             output.extend_from_slice(&I.unwrap().to_le_bytes());
-            internal_encoder.add_seq_to_dict((byte, I));
+
+            let pair_added = internal_encoder.add_seq_to_dict((byte, I));
+
+            if !pair_added && internal_encoder.clear_dict_on_overfill {
+                internal_encoder.set_init_dict();
+                output.extend_from_slice(&CLEAR_SYMBOL.to_le_bytes());
+            }
 
             I = Some(byte as u16);  // I -> idx of byte (bytes are filled sequentially)
         }
@@ -139,11 +135,34 @@ pub fn decode(input: &[u8]) -> Vec<u8> {
     }
 
     let mut old_I: u16 = I;
+    let mut is_first = true;
 
     for chunk in input[5..].chunks(2) {
         // Read next idx
         let I = u16::from_le_bytes(chunk.try_into().unwrap());
-        
+
+        // First byte logic
+        if is_first {
+            is_first = false;
+            // First byte should be always in the dict
+            if let Some((fb, _)) = internal_decoder.dict.get(I as usize) {
+                output.push(*fb);   // Send it directly to output
+            } else {
+                panic!("Corrupted input data: first index not in dictionary");
+            }
+
+            old_I = I;
+            continue;
+        }
+
+        // Check clear symbol
+        if I == CLEAR_SYMBOL {
+            internal_decoder.set_init_dict();
+            is_first = true;
+            continue;
+        }
+
+        // Normal processing
         if let Some(S) = internal_decoder.recover_seq_from_dict(I) {
             output.extend_from_slice(&S);
             internal_decoder.add_seq_to_dict((S[0], Some(old_I)));
@@ -283,7 +302,7 @@ pub fn decode_file(input_path: &str, output_path: &str) {
                 internal_decoder.add_seq_to_dict((old_S[0], Some(old_I)));
 
                 // Set I to newly added sequence
-                old_I = internal_decoder.get_last_dict_index() + 1;
+                old_I = internal_decoder.get_last_dict_index();
             }
         }
     }
